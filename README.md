@@ -1,4 +1,4 @@
-# CryptoVault - Ethereum Smart Contract
+# CryptoVault - Multi-Signature Wallet
 
 ![CryptoVault](https://img.shields.io/badge/Blockchain-Ethereum-blue.svg)
 ![Solidity](https://img.shields.io/badge/Smart_Contract-Solidity-orange.svg)
