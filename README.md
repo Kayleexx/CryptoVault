@@ -64,3 +64,7 @@ For an ERC20 token transfer:
 | `addSigner` | Adds a new wallet signer. |
 | `removeSigner` | Removes a wallet signer. |
 
+## Output
+![image](https://github.com/user-attachments/assets/aa0828a5-2ed9-4d44-930a-a0821511cad4)
+![image](https://github.com/user-attachments/assets/c40676b4-f8b8-441f-b120-a093554a5519)
+
