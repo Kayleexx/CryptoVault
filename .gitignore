@@ -1,0 +1,39 @@
+# Node modules
+node_modules/
+dist/
+
+# Hardhat build artifacts
+artifacts/
+cache/
+build-info/
+
+# Environment variables
+.env
+
+# Hardhat temporary files
+*.log
+*.tmp
+*.tsbuildinfo
+
+# VS Code settings
+.vscode/
+
+# Dependencies lock files
+package-lock.json
+yarn.lock
+
+# Compiled contract artifacts
+typechain/
+coverage/
+coverage.json
+
+src/contractABI.json
+
+public/
+
+# Hardhat specific files
+.hardhat/
+.hintrc
+
+# MacOS system files
+.DS_Store
