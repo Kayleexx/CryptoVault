@@ -14,8 +14,8 @@ function HomePage() {
   const connectWallet = async () => {
     if (window.ethereum) {
       setIsConnecting(true);
-      const web3 = new Web3(window.ethereum);
       try {
+        const web3 = new Web3(window.ethereum);
         const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
         setAccount(accounts[0]);
         navigate("/app");
@@ -89,14 +89,25 @@ function AppPage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isApproving, setIsApproving] = useState({});
   const [requiredSignatures, setRequiredSignatures] = useState(0);
+  const [isAuthorizedSigner, setIsAuthorizedSigner] = useState(false);
+  const [transactionEvents, setTransactionEvents] = useState([]);
+  const [gasPrice, setGasPrice] = useState(null);
 
+  // Initialize web3 and contract
   useEffect(() => {
     const initializeWeb3 = async () => {
       if (window.ethereum) {
         try {
-          // Setup web3 instance
+          // Setup web3 instance with higher timeout
           const web3Instance = new Web3(window.ethereum);
+          web3Instance.eth.transactionBlockTimeout = 100; // Higher block timeout
+          web3Instance.eth.transactionPollingTimeout = 1000; // Longer polling
           setWeb3(web3Instance);
+          
+          // Get current gas price
+          const currentGasPrice = await web3Instance.eth.getGasPrice();
+          // Add 20% to ensure transaction doesn't get stuck
+          setGasPrice(Math.floor(parseInt(currentGasPrice) * 1.2).toString());
           
           // Get connected account
           const accounts = await window.ethereum.request({ method: "eth_accounts" });
@@ -104,31 +115,56 @@ function AppPage() {
             navigate("/");
             return;
           }
+          
           setAccount(accounts[0]);
           
-          // Initialize contract
-          const contractInstance = new web3Instance.eth.Contract(contractABI, contractAddress);
-          setContract(contractInstance);
+          // Initialize contract with proper error handling
+          try {
+            const contractInstance = new web3Instance.eth.Contract(
+              contractABI, 
+              contractAddress,
+              { from: accounts[0] }
+            );
+            setContract(contractInstance);
+          } catch (contractError) {
+            console.error("Contract initialization error:", contractError);
+            alert("Failed to initialize smart contract. Please check contract address and ABI.");
+            navigate("/");
+            return;
+          }
           
           // Get ETH balance
           const accountBalance = await web3Instance.eth.getBalance(accounts[0]);
           setBalance(web3Instance.utils.fromWei(accountBalance, "ether"));
           
           // Setup event listeners for account changes
-          window.ethereum.on("accountsChanged", (newAccounts) => {
-            if (newAccounts.length === 0) {
-              navigate("/");
-            } else {
-              setAccount(newAccounts[0]);
-            }
-          });
+          window.ethereum.on("accountsChanged", handleAccountsChanged);
+          window.ethereum.on("chainChanged", () => window.location.reload());
+          
         } catch (error) {
           console.error("Initialization error:", error);
+          alert("Failed to connect to blockchain. Please check your wallet connection.");
           navigate("/");
         }
       } else {
-        alert("Please install MetaMask");
+        alert("Please install MetaMask to use CryptoVault");
         navigate("/");
+      }
+    };
+    
+    const handleAccountsChanged = async (newAccounts) => {
+      if (newAccounts.length === 0) {
+        navigate("/");
+      } else {
+        setAccount(newAccounts[0]);
+        if (web3) {
+          const newBalance = await web3.eth.getBalance(newAccounts[0]);
+          setBalance(web3.utils.fromWei(newBalance, "ether"));
+          // Reset state when account changes
+          setIsLoading(true);
+          await loadTransactions();
+          await checkSignerStatus(newAccounts[0]);
+        }
       }
     };
     
@@ -137,198 +173,273 @@ function AppPage() {
     return () => {
       // Cleanup event listeners
       if (window.ethereum) {
-        window.ethereum.removeAllListeners("accountsChanged");
+        window.ethereum.removeListener("accountsChanged", handleAccountsChanged);
       }
     };
   }, [navigate]);
 
-  useEffect(() => {
-    if (contract && account) {
-      loadTransactions();
-      fetchRequiredSignatures();
+  // Check if user is authorized signer
+  const checkSignerStatus = async (currentAccount = account) => {
+    if (!contract || !currentAccount) return false;
+    
+    try {
+      // First attempt: Try direct method call if available
+      try {
+        const isAuthorized = await contract.methods.isSigner(currentAccount).call();
+        setIsAuthorizedSigner(!!isAuthorized);
+        return !!isAuthorized;
+      } catch (methodError) {
+        console.warn("isSigner method not available, trying alternative approach");
+      }
+      
+      // Second attempt: Check via events
+      const signerAddedEvents = await contract.getPastEvents('SignerAdded', {
+        filter: { signer: currentAccount },
+        fromBlock: 0,
+        toBlock: 'latest'
+      });
+      
+      const signerRemovedEvents = await contract.getPastEvents('SignerRemoved', {
+        filter: { signer: currentAccount },
+        fromBlock: 0,
+        toBlock: 'latest'
+      });
+      
+      // If more added events than removed, account is a signer
+      const isSigner = signerAddedEvents.length > signerRemovedEvents.length;
+      setIsAuthorizedSigner(isSigner);
+      return isSigner;
+      
+    } catch (error) {
+      console.error("Error checking signer status:", error);
+      return false;
     }
-  }, [contract, account]);
+  };
+
+  // Load contract data when contract is initialized
+  useEffect(() => {
+    const loadContractData = async () => {
+      if (contract && account && web3) {
+        try {
+          await Promise.all([
+            fetchRequiredSignatures(),
+            checkSignerStatus(),
+            loadTransactions()
+          ]);
+        } catch (error) {
+          console.error("Error loading contract data:", error);
+        }
+      }
+    };
+    
+    if (contract && account && web3) {
+      loadContractData();
+    }
+  }, [contract, account, web3]);
 
   const fetchRequiredSignatures = async () => {
-    if (contract) {
-      try {
-        const sigs = await contract.methods.requiredSignatures().call();
-        setRequiredSignatures(parseInt(sigs));
-      } catch (error) {
-        console.error("Error fetching required signatures:", error);
-      }
+    if (!contract) return;
+    
+    try {
+      const sigs = await contract.methods.requiredSignatures().call();
+      setRequiredSignatures(parseInt(sigs));
+    } catch (error) {
+      console.error("Error fetching required signatures:", error);
+      // Set default value if unable to fetch
+      setRequiredSignatures(2);
     }
   };
 
   const loadTransactions = async () => {
+    if (!contract || !web3 || !account) {
+      console.warn("Contract, web3 or account not initialized");
+      return;
+    }
+    
     setIsLoading(true);
+    
     try {
-      // Get transaction count
-      const txCount = await contract.methods.transactionCount().call();
-      
-      // Load all transactions
-      const txPromises = [];
-      for (let i = 0; i < txCount; i++) {
-        txPromises.push(loadTransactionDetails(i));
+      // Get transaction count with retry logic
+      let txCount;
+      try {
+        txCount = await contract.methods.transactionCount().call();
+        console.log(`Found ${txCount} transactions`);
+      } catch (countError) {
+        console.error("Error fetching transaction count:", countError);
+        txCount = 0;
       }
       
-      const txDetails = await Promise.all(txPromises);
+      // Load all relevant events
+      const [submittedEvents, executedEvents, signedEvents] = await Promise.all([
+        contract.getPastEvents('TransactionSubmitted', { fromBlock: 0, toBlock: 'latest' }),
+        contract.getPastEvents('TransactionExecuted', { fromBlock: 0, toBlock: 'latest' }),
+        contract.getPastEvents('TransactionSigned', { fromBlock: 0, toBlock: 'latest' })
+      ]);
       
-      // Filter out null values and separate executed and pending transactions
-      const validTxs = txDetails.filter(tx => tx !== null);
-      const executed = [];
-      const pending = [];
+      // Create maps for quick lookups
+      const executedTxIds = new Set(executedEvents.map(event => event.returnValues.txId));
       
-      validTxs.forEach(tx => {
-        if (tx.executed) {
-          executed.push(tx);
-        } else {
-          pending.push(tx);
+      // Count signatures per transaction
+      const signatureCountMap = {};
+      signedEvents.forEach(event => {
+        const txId = event.returnValues.txId;
+        signatureCountMap[txId] = (signatureCountMap[txId] || 0) + 1;
+      });
+      
+      // Check if current user has signed each transaction
+      const userSignatureMap = {};
+      signedEvents.forEach(event => {
+        if (event.returnValues.signer.toLowerCase() === account.toLowerCase()) {
+          userSignatureMap[event.returnValues.txId] = true;
         }
       });
       
-      setTransactions(executed.reverse()); // Most recent first
-      setPendingTransactions(pending.reverse());
+      // Process transactions with error handling
+      const allTransactions = await Promise.all(submittedEvents.map(async (event) => {
+        try {
+          const txId = event.returnValues.txId;
+          const to = event.returnValues.to;
+          const value = web3.utils.fromWei(event.returnValues.value, "ether");
+          
+          // Extract transaction data from event logs if possible
+          let txData = "0x";
+          try {
+            // Try to decode data from event logs
+            if (event.raw && event.raw.data) {
+              txData = event.raw.data;
+            } else {
+              // Fallback: try to get from transaction receipt
+              const receipt = await web3.eth.getTransactionReceipt(event.transactionHash);
+              if (receipt && receipt.logs && receipt.logs.length > 0) {
+                txData = receipt.logs[0].data;
+              }
+            }
+          } catch (dataError) {
+            console.warn(`Could not fetch data for tx ${txId}:`, dataError);
+          }
+          
+          // Get timestamp from block
+          let timestamp = Date.now();
+          try {
+            const block = await web3.eth.getBlock(event.blockNumber);
+            if (block && block.timestamp) {
+              timestamp = block.timestamp * 1000;
+            }
+          } catch (blockError) {
+            console.warn(`Could not fetch block for tx ${txId}:`, blockError);
+          }
+          
+          return {
+            id: txId,
+            to: to,
+            value: value,
+            data: txData,
+            executed: executedTxIds.has(txId),
+            sigCount: signatureCountMap[txId] || 0,
+            requiredSigs: requiredSignatures,
+            hasSigned: !!userSignatureMap[txId],
+            timestamp: timestamp
+          };
+        } catch (processingError) {
+          console.error(`Error processing transaction ${event.returnValues?.txId}:`, processingError);
+          return null;
+        }
+      }));
+      
+      // Filter out failed transaction processing
+      const validTransactions = allTransactions.filter(tx => tx !== null);
+      
+      // Sort and filter transactions
+      const executed = validTransactions.filter(tx => tx.executed).sort((a, b) => b.id - a.id);
+      const pending = validTransactions.filter(tx => !tx.executed).sort((a, b) => b.id - a.id);
+      
+      setTransactions(executed);
+      setPendingTransactions(pending);
     } catch (error) {
       console.error("Failed to fetch transactions", error);
+      // Set empty arrays as fallback
+      setTransactions([]);
+      setPendingTransactions([]);
     } finally {
       setIsLoading(false);
     }
   };
 
-  const loadTransactionDetails = async (txId) => {
-    try {
-      // Check if we need to use a getter function instead of direct mapping access
-      let tx;
-      if (typeof contract.methods.getTransaction === 'function') {
-        // Try using a getter function if it exists
-        tx = await contract.methods.getTransaction(txId).call();
-      } else {
-        // Try accessing the transactions mapping through the array-like syntax
-        // This is a common pattern in Solidity where mapping access is done through a function call
-        tx = await contract.methods.transactions(txId).call();
-      }
-      
-      // Format data for display
-      const formattedValue = web3.utils.fromWei(tx.value, "ether");
-      
-      // Check if current user has signed
-      const hasSigned = await contract.methods.signatures(txId, account).call();
-      
-      // Get required signatures
-      const requiredSigs = await contract.methods.requiredSignatures().call();
-      
-      // Create more realistic timestamp (24 hours between transactions)
-      const mockTimestamp = Date.now() - (txId * 86400000); 
-      
-      return {
-        id: txId,
-        to: tx.to,
-        value: formattedValue,
-        data: tx.data,
-        executed: tx.executed,
-        sigCount: parseInt(tx.sigCount),
-        requiredSigs: parseInt(requiredSigs),
-        hasSigned,
-        timestamp: mockTimestamp
-      };
-    } catch (error) {
-      console.error(`Error loading transaction ${txId}:`, error);
-      
-      // Try to determine if this is an out-of-bounds error vs a method error
-      if (error.message.includes("out of bounds") || 
-          error.message.includes("invalid opcode") ||
-          error.message.includes("transaction doesn't exist")) {
-        // Transaction doesn't exist, return null to indicate we've reached the end
-        return null;
-      }
-      
-      // For debugging, log the available methods on the contract
-      console.log("Available contract methods:", Object.keys(contract.methods));
-      
-      // Return minimal placeholder data if transaction exists but couldn't be loaded completely
-      return {
-        id: txId,
-        to: "0x0000000000000000000000000000000000000000",
-        value: "0",
-        data: "0x",
-        executed: false,
-        sigCount: 0,
-        requiredSigs: requiredSignatures,
-        hasSigned: false,
-        timestamp: Date.now() - (txId * 86400000)
-      };
-    }
-  };
-  const detectContractStructure = () => {
-    if (!contract) return;
-    
-    console.log("Available contract methods:", 
-      Object.keys(contract.methods)
-        .filter(key => typeof contract.methods[key] === 'function')
-        .filter(key => !key.includes('('))
-    );
-    
-    // Check common multi-sig methods
-    const methodsToCheck = [
-      'transactionCount', 'getTransactionCount',
-      'transactions', 'getTransaction',
-      'getTransactions', 'getAllTransactions'
-    ];
-    
-    methodsToCheck.forEach(method => {
-      if (typeof contract.methods[method] === 'function') {
-        console.log(`Method available: ${method}`);
-      }
-    });
-  };
-  useEffect(() => {
-    if (contract && account) {
-      detectContractStructure(); // Add this line
-      loadTransactions();
-      fetchRequiredSignatures();
-    }
-  }, [contract, account]);
   const signTransaction = async (txId) => {
+    if (!isAuthorizedSigner) {
+      alert("Your account is not an authorized signer for this vault");
+      return;
+    }
+    
+    // Check if already signed
+    const pendingTx = pendingTransactions.find(tx => tx.id === txId);
+    if (pendingTx?.hasSigned) {
+      alert("You have already signed this transaction");
+      return;
+    }
+    
     setIsApproving({...isApproving, [txId]: true});
+    
     try {
-      // Get current gas price
-      const gasPrice = await web3.eth.getGasPrice();
-      
-      // Estimate gas needed for the transaction
-      const estimatedGas = await contract.methods.signTransaction(txId)
-        .estimateGas({ from: account })
-        .catch(error => {
-          // Check for common error patterns
-          if (error.message.includes("already signed")) {
-            throw new Error("You have already signed this transaction");
-          } else if (error.message.includes("executed")) {
-            throw new Error("This transaction has already been executed");
-          } else {
-            throw error;
-          }
-        });
-      
-      // Proceed with transaction with appropriate gas parameters
-      await contract.methods.signTransaction(txId).send({ 
-        from: account,
-        gas: Math.floor(estimatedGas * 1.2), // Add 20% buffer
-        gasPrice
+      // Use dynamic gas calculation with buffer
+      const gasEstimate = await contract.methods.signTransaction(txId).estimateGas({
+        from: account
+      }).catch(error => {
+        // If estimation fails, use safe default
+        console.warn("Gas estimation failed:", error);
+        return 250000; // Safe default value
       });
+      
+      // Add 30% buffer to gas estimate for safety
+      const gasLimit = Math.floor(gasEstimate * 1.3);
+      
+      // Get current gas price with 10% buffer
+      const currentGasPrice = await web3.eth.getGasPrice();
+      const adjustedGasPrice = Math.floor(parseInt(currentGasPrice) * 1.1).toString();
+      
+      // Sign transaction with optimized gas settings
+      const result = await contract.methods.signTransaction(txId).send({ 
+        from: account,
+        gas: gasLimit,
+        gasPrice: adjustedGasPrice
+      });
+      
+      console.log("Transaction signed successfully:", result);
       
       // Reload transactions after successful signing
       await loadTransactions();
     } catch (error) {
       console.error("Signing failed", error);
       
-      // User-friendly error handling
+      // Enhanced error handling
       let errorMessage = "Transaction signing failed";
-      if (error.message.includes("already signed")) {
-        errorMessage = "You have already signed this transaction";
-      } else if (error.message.includes("executed")) {
-        errorMessage = "This transaction has already been executed";
+      
+      // Check for specific error types
+      if (error.message.includes("execution reverted")) {
+        // Parse custom error from solidity
+        const errorMatch = error.message.match(/reverted with custom error '(\w+)'/);
+        if (errorMatch && errorMatch[1]) {
+          // Map contract errors to user-friendly messages
+          const errorMap = {
+            'NotAuthorized': "You are not authorized to sign this transaction",
+            'AlreadySigned': "You have already signed this transaction",
+            'AlreadyExecuted': "This transaction has already been executed",
+            'InvalidTransaction': "Invalid transaction ID"
+          };
+          errorMessage = errorMap[errorMatch[1]] || `Contract error: ${errorMatch[1]}`;
+        } else if (error.message.includes("revert")) {
+          // Try to extract revert reason
+          const reasonMatch = error.message.match(/reason string: '(.+?)'/);
+          if (reasonMatch && reasonMatch[1]) {
+            errorMessage = `Transaction failed: ${reasonMatch[1]}`;
+          }
+        }
       } else if (error.message.includes("User denied")) {
-        errorMessage = "Transaction was rejected in your wallet";
+        errorMessage = "You rejected the transaction in your wallet";
+      } else if (error.message.includes("Transaction underpriced")) {
+        errorMessage = "Transaction failed: Gas price too low. Please try again with higher gas price.";
+      } else if (error.message.includes("out of gas")) {
+        errorMessage = "Transaction failed: Out of gas. Please try again with higher gas limit.";
       }
       
       alert(errorMessage);
@@ -341,40 +452,78 @@ function AppPage() {
     e.preventDefault();
     setIsSubmitting(true);
     
+    // Validate form data
+    if (!web3.utils.isAddress(newTxData.recipient)) {
+      alert("Invalid recipient address");
+      setIsSubmitting(false);
+      return;
+    }
+    
+    if (isNaN(parseFloat(newTxData.amount)) && newTxData.amount !== "") {
+      alert("Invalid amount: Please enter a valid number");
+      setIsSubmitting(false);
+      return;
+    }
+    
+    // Normalize transaction data
+    let txData = newTxData.data?.trim() || "0x";
+    if (txData !== "0x" && !txData.startsWith("0x")) {
+      txData = "0x" + txData;
+    }
+    
+    // Validate hex format
+    if (txData !== "0x") {
+      try {
+        web3.utils.hexToBytes(txData);
+      } catch (error) {
+        alert("Invalid transaction data format. Please provide valid hex data starting with '0x'");
+        setIsSubmitting(false);
+        return;
+      }
+    }
+    
     try {
-      // Validate recipient address
-      if (!web3.utils.isAddress(newTxData.recipient)) {
-        alert("Invalid recipient address");
+      // Convert ETH to Wei with proper validation
+      let valueInWei;
+      try {
+        valueInWei = web3.utils.toWei(newTxData.amount || "0", "ether");
+      } catch (conversionError) {
+        alert("Invalid ETH amount. Please enter a valid number.");
         setIsSubmitting(false);
         return;
       }
       
-      // Validate transaction data format
-      let txData = newTxData.data || "0x";
-      if (txData !== "0x" && !txData.startsWith("0x")) {
-        txData = "0x" + txData;
-      }
-      
-      // Additional validation for hex format
-      if (txData !== "0x") {
-        try {
-          web3.utils.hexToBytes(txData); // This will throw if invalid hex
-        } catch (error) {
-          alert("Invalid transaction data format. Please provide valid hex data starting with '0x'");
-          setIsSubmitting(false);
-          return;
-        }
-      }
-      
-      // Convert ETH to Wei
-      const valueInWei = web3.utils.toWei(newTxData.amount || "0", "ether");
-      
-      // Submit transaction
-      await contract.methods.submitTransaction(
+      // Gas estimation with fallback
+      const gasEstimate = await contract.methods.submitTransaction(
         newTxData.recipient,
         valueInWei,
         txData
-      ).send({ from: account });
+      ).estimateGas({
+        from: account
+      }).catch(error => {
+        console.warn("Gas estimation failed:", error);
+        return 300000; // Safe default value
+      });
+      
+      // Add 30% buffer to gas estimate
+      const gasLimit = Math.floor(gasEstimate * 1.3);
+      
+      // Get current gas price with 10% buffer
+      const currentGasPrice = await web3.eth.getGasPrice();
+      const adjustedGasPrice = Math.floor(parseInt(currentGasPrice) * 1.1).toString();
+      
+      // Submit transaction with optimized parameters
+      const result = await contract.methods.submitTransaction(
+        newTxData.recipient,
+        valueInWei,
+        txData
+      ).send({ 
+        from: account,
+        gas: gasLimit,
+        gasPrice: adjustedGasPrice
+      });
+      
+      console.log("Transaction submitted successfully:", result);
       
       // Reset form and reload transactions
       setNewTxData({
@@ -386,7 +535,38 @@ function AppPage() {
       await loadTransactions();
     } catch (error) {
       console.error("Transaction submission failed", error);
-      alert(`Transaction failed: ${error.message}`);
+      
+      // Detailed error handling
+      let errorMessage = "Transaction failed";
+      
+      if (error.message.includes("execution reverted")) {
+        // Parse custom error from solidity
+        const errorMatch = error.message.match(/reverted with custom error '(\w+)'/);
+        if (errorMatch && errorMatch[1]) {
+          const errorMap = {
+            'NotAuthorized': "Only the contract owner can submit transactions",
+            'InvalidAddress': "Invalid recipient address",
+            'InvalidTransaction': "Transaction validation failed"
+          };
+          errorMessage = errorMap[errorMatch[1]] || `Contract error: ${errorMatch[1]}`;
+        } else {
+          // Try to extract revert reason
+          const reasonMatch = error.message.match(/reason string: '(.+?)'/);
+          if (reasonMatch && reasonMatch[1]) {
+            errorMessage = `Transaction failed: ${reasonMatch[1]}`;
+          } else {
+            errorMessage = "Transaction failed: Contract execution reverted";
+          }
+        }
+      } else if (error.message.includes("User denied")) {
+        errorMessage = "You rejected the transaction in your wallet";
+      } else if (error.message.includes("insufficient funds")) {
+        errorMessage = "Insufficient ETH balance to submit transaction";
+      } else if (error.message.includes("nonce too low")) {
+        errorMessage = "Transaction error: Nonce too low. Please refresh the page and try again.";
+      }
+      
+      alert(errorMessage);
     } finally {
       setIsSubmitting(false);
     }
@@ -397,9 +577,17 @@ function AppPage() {
     return `${address.substring(0, 6)}...${address.substring(address.length - 4)}`;
   };
 
-  // Format timestamp to readable date
   const formatDate = (timestamp) => {
     return new Date(timestamp).toLocaleString();
+  };
+
+  // Format data for display (truncate long hex strings)
+  const formatData = (data) => {
+    if (!data || data === "0x") return "0x";
+    if (data.length > 50) {
+      return `${data.substring(0, 25)}...${data.substring(data.length - 20)}`;
+    }
+    return data;
   };
 
   return (
@@ -414,6 +602,11 @@ function AppPage() {
           <div className="account-address">
             <span className="address-label">Connected:</span>
             <span className="address">{shortenAddress(account || "")}</span>
+            {!isAuthorizedSigner && (
+              <div className="unauthorized-warning">
+                ⚠️ Not an authorized signer
+              </div>
+            )}
           </div>
           <div className="account-balance">
             <span>{parseFloat(balance).toFixed(4)} ETH</span>
@@ -457,6 +650,12 @@ function AppPage() {
             {activeTab === "pending" && (
               <div className="transaction-section">
                 <h2>Pending Transactions</h2>
+                <button 
+                  className="refresh-button"
+                  onClick={() => loadTransactions()}
+                >
+                  🔄 Refresh
+                </button>
                 {pendingTransactions.length === 0 ? (
                   <div className="empty-state">
                     <p>No pending transactions</p>
@@ -482,7 +681,7 @@ function AppPage() {
                           {tx.data !== "0x" && (
                             <div className="detail-row">
                               <span className="detail-label">Data:</span>
-                              <span className="detail-value data">{tx.data}</span>
+                              <span className="detail-value data">{formatData(tx.data)}</span>
                             </div>
                           )}
                         </div>
@@ -508,7 +707,8 @@ function AppPage() {
                             <button 
                               className="btn-sign" 
                               onClick={() => signTransaction(tx.id)}
-                              disabled={isApproving[tx.id]}
+                              disabled={isApproving[tx.id] || !isAuthorizedSigner}
+                              title={!isAuthorizedSigner ? "Your account is not an authorized signer" : ""}
                             >
                               {isApproving[tx.id] ? "Signing..." : "Sign Transaction"}
                             </button>
@@ -524,6 +724,12 @@ function AppPage() {
             {activeTab === "executed" && (
               <div className="transaction-section">
                 <h2>Executed Transactions</h2>
+                <button 
+                  className="refresh-button"
+                  onClick={() => loadTransactions()}
+                >
+                  🔄 Refresh
+                </button>
                 {transactions.length === 0 ? (
                   <div className="empty-state">
                     <p>No executed transactions</p>
@@ -549,7 +755,7 @@ function AppPage() {
                           {tx.data !== "0x" && (
                             <div className="detail-row">
                               <span className="detail-label">Data:</span>
-                              <span className="detail-value data">{tx.data}</span>
+                              <span className="detail-value data">{formatData(tx.data)}</span>
                             </div>
                           )}
                         </div>
@@ -576,7 +782,7 @@ function AppPage() {
                         id="recipient"
                         placeholder="0x..."
                         value={newTxData.recipient}
-                        onChange={(e) => setNewTxData({...newTxData, recipient: e.target.value})}
+                        onChange={(e) => setNewTxData({...newTxData, recipient: e.target.value.trim()})}
                         required
                       />
                     </div>
@@ -584,31 +790,34 @@ function AppPage() {
                     <div className="form-group">
                       <label htmlFor="amount">Amount (ETH)</label>
                       <input 
-                        type="number" 
+                        type="text" 
                         id="amount"
-                        min="0"
-                        step="0.0001"
                         placeholder="0.0"
                         value={newTxData.amount}
-                        onChange={(e) => setNewTxData({...newTxData, amount: e.target.value})}
+                        onChange={(e) => {
+                          // Allow only valid number inputs
+                          const value = e.target.value.replace(/[^0-9.]/g, '');
+                          setNewTxData({...newTxData, amount: value});
+                        }}
                       />
                     </div>
                     
                     <div className="form-group">
-  <label htmlFor="data">Transaction Data (optional)</label>
-  <textarea 
-    id="data"
-    placeholder="0x..."
-    value={newTxData.data}
-    onChange={(e) => {
-      const value = e.target.value.trim();
-      setNewTxData({...newTxData, data: value});
-    }}
-  />
-  <small className="form-hint">
-    Enter hex data for contract interactions (must be valid hex starting with 0x)
-  </small>
-</div>
+                      <label htmlFor="data">Transaction Data (optional)</label>
+                      <textarea 
+                        id="data"
+                        placeholder="0x..."
+                        value={newTxData.data}
+                        onChange={(e) => {
+                          // Clean up data input
+                          const value = e.target.value.trim();
+                          setNewTxData({...newTxData, data: value});
+                        }}
+                      />
+                      <small className="form-hint">
+                        Enter hex data for contract interactions (must be valid hex starting with 0x)
+                      </small>
+                    </div>
                     
                     <div className="form-notice">
                       <p>
